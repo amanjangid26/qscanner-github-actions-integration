@@ -1,0 +1,500 @@
+name: Container Security Scan with Qualys
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Docker image to scan'
+        required: true
+        default: 'tomcat:10.0.0-M6-jdk11-corretto'
+        type: string
+      
+      policy_tags:
+        description: 'Qualys policy tags (comma-separated)'
+        required: true
+        default: '2026_forrester_image_policy'
+        type: string
+      
+      push_on_success:
+        description: 'Push image to registry if scan passes?'
+        required: true
+        type: boolean
+        default: false
+      
+      target_registry:
+        description: 'Target registry for push'
+        required: false
+        type: choice
+        options:
+          - docker.io
+          - ghcr.io
+          - both
+        default: 'docker.io'
+      
+      target_repository:
+        description: 'Target repository (e.g., myorg/myapp)'
+        required: false
+        type: string
+        default: ''
+      
+      critical_threshold:
+        description: 'Maximum critical vulnerabilities allowed'
+        required: true
+        type: number
+        default: 0
+      
+      high_threshold:
+        description: 'Maximum high vulnerabilities allowed'
+        required: true
+        type: number
+        default: 5
+
+env:
+  QSCANNER_VERSION: v4.5.0
+
+jobs:
+  security-scan:
+    name: 🔍 Qualys Security Scan
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      security-events: write
+      packages: write
+    
+    outputs:
+      scan_passed: ${{ steps.threshold_check.outputs.passed }}
+      critical_count: ${{ steps.parse_results.outputs.critical }}
+      high_count: ${{ steps.parse_results.outputs.high }}
+      medium_count: ${{ steps.parse_results.outputs.medium }}
+      total_count: ${{ steps.parse_results.outputs.total }}
+    
+    steps:
+      - name: 📋 Job Information
+        run: |
+          echo "╔══════════════════════════════════════════════════════╗"
+          echo "║       Qualys Container Security Scan Started         ║"
+          echo "╚══════════════════════════════════════════════════════╝"
+          echo ""
+          echo "🐳 Image to scan: ${{ inputs.image }}"
+          echo "🏷️  Policy tags: ${{ inputs.policy_tags }}"
+          echo "📊 Critical threshold: ${{ inputs.critical_threshold }}"
+          echo "📊 High threshold: ${{ inputs.high_threshold }}"
+          echo "🚀 Push on success: ${{ inputs.push_on_success }}"
+          echo "📦 Target registry: ${{ inputs.target_registry }}"
+          echo "👤 Triggered by: ${{ github.actor }}"
+          echo ""
+      
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: 📥 Pull Docker image
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📥 STEP 1: Pulling Docker Image"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Image: ${{ inputs.image }}"
+          docker pull ${{ inputs.image }}
+          echo ""
+          echo "✅ Image pulled successfully"
+          docker images | grep -E "REPOSITORY|$(echo ${{ inputs.image }} | cut -d':' -f1)" || docker images
+      
+      - name: ⬇️ Download Qualys Scanner
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "⬇️  STEP 2: Downloading Qualys Scanner"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Version: ${{ env.QSCANNER_VERSION }}"
+          curl -L "https://www.qualys.com/qscanner/download/${{ env.QSCANNER_VERSION }}/download_qscanner.sh" -o download_qscanner.sh
+          chmod +x download_qscanner.sh
+          bash ./download_qscanner.sh
+          chmod +x ./linux-amd64/qscanner
+          echo ""
+          echo "✅ Scanner downloaded successfully"
+          ./linux-amd64/qscanner version
+      
+      - name: 🔍 Run Qualys Security Scan
+        id: qualys_scan
+        continue-on-error: true
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔍 STEP 3: Running Security Scan"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Scan started at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+          
+          ./linux-amd64/qscanner image ${{ inputs.image }} \
+            --mode evaluate-policy \
+            --report-format json \
+            --pod ${{ secrets.QUALYS_POD }} \
+            --access-token ${{ secrets.QUALYS_ACCESS_TOKEN }} \
+            --tags "${{ inputs.policy_tags }}" \
+            --output-file qualys-report.json \
+            && echo "SCAN_STATUS=passed" >> $GITHUB_OUTPUT \
+            || echo "SCAN_STATUS=failed" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "Scan completed at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          
+          if [ "${{ steps.qualys_scan.outputs.SCAN_STATUS }}" == "passed" ]; then
+            echo "✅ Scan completed successfully"
+          else
+            echo "⚠️  Scan completed with policy violations"
+          fi
+      
+      - name: 📊 Parse Scan Results
+        id: parse_results
+        if: always()
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📊 STEP 4: Analyzing Results"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          
+          if [ -f "qualys-report.json" ]; then
+            # Extract vulnerability counts (adjust based on actual Qualys JSON structure)
+            CRITICAL=$(jq -r '.vulnerabilities | map(select(.severity == "CRITICAL" or .severity == "5")) | length' qualys-report.json 2>/dev/null || echo "0")
+            HIGH=$(jq -r '.vulnerabilities | map(select(.severity == "HIGH" or .severity == "4")) | length' qualys-report.json 2>/dev/null || echo "0")
+            MEDIUM=$(jq -r '.vulnerabilities | map(select(.severity == "MEDIUM" or .severity == "3")) | length' qualys-report.json 2>/dev/null || echo "0")
+            LOW=$(jq -r '.vulnerabilities | map(select(.severity == "LOW" or .severity == "2")) | length' qualys-report.json 2>/dev/null || echo "0")
+            TOTAL=$(jq -r '.vulnerabilities | length' qualys-report.json 2>/dev/null || echo "0")
+            
+            echo "critical=${CRITICAL}" >> $GITHUB_OUTPUT
+            echo "high=${HIGH}" >> $GITHUB_OUTPUT
+            echo "medium=${MEDIUM}" >> $GITHUB_OUTPUT
+            echo "low=${LOW}" >> $GITHUB_OUTPUT
+            echo "total=${TOTAL}" >> $GITHUB_OUTPUT
+            
+            echo "╔════════════════════════════════════════╗"
+            echo "║     Vulnerability Summary              ║"
+            echo "╠════════════════════════════════════════╣"
+            echo "║  🔴 Critical:      $(printf '%4s' ${CRITICAL})                 ║"
+            echo "║  🟠 High:          $(printf '%4s' ${HIGH})                 ║"
+            echo "║  🟡 Medium:        $(printf '%4s' ${MEDIUM})                 ║"
+            echo "║  🟢 Low:           $(printf '%4s' ${LOW})                 ║"
+            echo "║  ═══════════════════════════════       ║"
+            echo "║  📊 Total:         $(printf '%4s' ${TOTAL})                 ║"
+            echo "╚════════════════════════════════════════╝"
+          else
+            echo "⚠️  Warning: Scan report not found"
+            echo "critical=0" >> $GITHUB_OUTPUT
+            echo "high=0" >> $GITHUB_OUTPUT
+            echo "medium=0" >> $GITHUB_OUTPUT
+            echo "low=0" >> $GITHUB_OUTPUT
+            echo "total=0" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: 🎯 Check Vulnerability Thresholds
+        id: threshold_check
+        if: always()
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🎯 STEP 5: Threshold Validation"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          
+          CRITICAL=${{ steps.parse_results.outputs.critical }}
+          HIGH=${{ steps.parse_results.outputs.high }}
+          CRITICAL_LIMIT=${{ inputs.critical_threshold }}
+          HIGH_LIMIT=${{ inputs.high_threshold }}
+          
+          echo "Configured Thresholds:"
+          echo "  Critical: ${CRITICAL_LIMIT}"
+          echo "  High: ${HIGH_LIMIT}"
+          echo ""
+          echo "Found Vulnerabilities:"
+          echo "  Critical: ${CRITICAL}"
+          echo "  High: ${HIGH}"
+          echo ""
+          
+          THRESHOLD_PASSED=true
+          
+          if [ "${CRITICAL}" -gt "${CRITICAL_LIMIT}" ]; then
+            echo "❌ FAILED: Critical vulnerabilities (${CRITICAL}) exceed threshold (${CRITICAL_LIMIT})"
+            THRESHOLD_PASSED=false
+          else
+            echo "✅ PASSED: Critical vulnerabilities within threshold"
+          fi
+          
+          if [ "${HIGH}" -gt "${HIGH_LIMIT}" ]; then
+            echo "❌ FAILED: High vulnerabilities (${HIGH}) exceed threshold (${HIGH_LIMIT})"
+            THRESHOLD_PASSED=false
+          else
+            echo "✅ PASSED: High vulnerabilities within threshold"
+          fi
+          
+          echo "passed=${THRESHOLD_PASSED}" >> $GITHUB_OUTPUT
+          
+          if [ "${THRESHOLD_PASSED}" != "true" ]; then
+            echo ""
+            echo "╔════════════════════════════════════════╗"
+            echo "║  ⚠️  THRESHOLD CHECK FAILED            ║"
+            echo "╚════════════════════════════════════════╝"
+            exit 1
+          else
+            echo ""
+            echo "╔════════════════════════════════════════╗"
+            echo "║  ✅ THRESHOLD CHECK PASSED             ║"
+            echo "╚════════════════════════════════════════╝"
+          fi
+      
+      - name: 📄 Upload Scan Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualys-scan-report-${{ github.run_number }}
+          path: |
+            qualys-report.json
+            *.log
+          retention-days: 90
+      
+      - name: 📝 Generate Summary Report
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          # 🔒 Qualys Security Scan Report
+          
+          ## 📋 Scan Information
+          
+          | Property | Value |
+          |----------|-------|
+          | 🐳 **Image** | `${{ inputs.image }}` |
+          | 🏷️ **Policy Tags** | `${{ inputs.policy_tags }}` |
+          | 📅 **Scan Date** | `$(date -u '+%Y-%m-%d %H:%M:%S UTC')` |
+          | 👤 **Triggered By** | `${{ github.actor }}` |
+          | 🔢 **Run Number** | `#${{ github.run_number }}` |
+          | 📍 **Pod** | `${{ secrets.QUALYS_POD }}` |
+          
+          ## 📊 Vulnerability Summary
+          
+          | Severity | Found | Threshold | Status |
+          |----------|-------|-----------|--------|
+          | 🔴 **Critical** | ${{ steps.parse_results.outputs.critical }} | ${{ inputs.critical_threshold }} | ${{ steps.parse_results.outputs.critical <= inputs.critical_threshold && '✅ Pass' || '❌ Fail' }} |
+          | 🟠 **High** | ${{ steps.parse_results.outputs.high }} | ${{ inputs.high_threshold }} | ${{ steps.parse_results.outputs.high <= inputs.high_threshold && '✅ Pass' || '❌ Fail' }} |
+          | 🟡 **Medium** | ${{ steps.parse_results.outputs.medium }} | - | ℹ️ Info |
+          | 🟢 **Low** | ${{ steps.parse_results.outputs.low }} | - | ℹ️ Info |
+          | **📊 Total** | **${{ steps.parse_results.outputs.total }}** | - | - |
+          
+          ## 🎯 Scan Result
+          
+          EOF
+          
+          if [ "${{ steps.threshold_check.outputs.passed }}" == "true" ]; then
+            cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ### ✅ PASSED
+          
+          The image passed all security checks and is within acceptable vulnerability thresholds.
+          EOF
+          else
+            cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ### ❌ FAILED
+          
+          The image failed security checks. Vulnerabilities exceed configured thresholds.
+          
+          **Action Required:** Review and remediate vulnerabilities before deployment.
+          EOF
+          fi
+          
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          
+          ## 📦 Next Steps
+          
+          EOF
+          
+          if [ "${{ inputs.push_on_success }}" == "true" ] && [ "${{ steps.threshold_check.outputs.passed }}" == "true" ]; then
+            echo "- ✅ Image will be pushed to registry: \`${{ inputs.target_registry }}\`" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ inputs.push_on_success }}" == "true" ]; then
+            echo "- ⚠️ Image will NOT be pushed (scan failed)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ℹ️ Push to registry is disabled for this run" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          - 📄 [Download detailed report from artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          
+          ---
+          
+          *Report generated by Qualys Scanner ${{ env.QSCANNER_VERSION }}*
+          EOF
+
+  push-image:
+    name: 🚀 Push Image to Registry
+    needs: security-scan
+    runs-on: ubuntu-latest
+    if: |
+      inputs.push_on_success == true && 
+      needs.security-scan.outputs.scan_passed == 'true'
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: 📋 Push Information
+        run: |
+          echo "╔══════════════════════════════════════════════════════╗"
+          echo "║         Pushing Image to Registry                    ║"
+          echo "╚══════════════════════════════════════════════════════╝"
+          echo ""
+          echo "🐳 Source image: ${{ inputs.image }}"
+          echo "📦 Target registry: ${{ inputs.target_registry }}"
+          echo "📁 Target repository: ${{ inputs.target_repository || 'same as source' }}"
+          echo ""
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: 📥 Pull scanned image
+        run: |
+          echo "Pulling verified image..."
+          docker pull ${{ inputs.image }}
+      
+      - name: 🔐 Log in to Docker Hub
+        if: inputs.target_registry == 'docker.io' || inputs.target_registry == 'both'
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: 🔐 Log in to GitHub Container Registry
+        if: inputs.target_registry == 'ghcr.io' || inputs.target_registry == 'both'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 🏷️ Tag and Push Image
+        run: |
+          SOURCE_IMAGE="${{ inputs.image }}"
+          TARGET_REPO="${{ inputs.target_repository }}"
+          
+          # Use source image name if target repo not specified
+          if [ -z "${TARGET_REPO}" ]; then
+            TARGET_REPO=$(echo ${SOURCE_IMAGE} | cut -d':' -f1)
+          fi
+          
+          TAG=$(echo ${SOURCE_IMAGE} | cut -d':' -f2)
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          
+          echo "Tagging and pushing images..."
+          echo ""
+          
+          if [ "${{ inputs.target_registry }}" == "docker.io" ] || [ "${{ inputs.target_registry }}" == "both" ]; then
+            TARGET_IMAGE="docker.io/${TARGET_REPO}:${TAG}"
+            TIMESTAMPED_IMAGE="docker.io/${TARGET_REPO}:${TAG}-${TIMESTAMP}"
+            
+            echo "📦 Pushing to Docker Hub:"
+            echo "  - ${TARGET_IMAGE}"
+            echo "  - ${TIMESTAMPED_IMAGE}"
+            
+            docker tag ${SOURCE_IMAGE} ${TARGET_IMAGE}
+            docker tag ${SOURCE_IMAGE} ${TIMESTAMPED_IMAGE}
+            docker push ${TARGET_IMAGE}
+            docker push ${TIMESTAMPED_IMAGE}
+            
+            echo "✅ Pushed to Docker Hub"
+          fi
+          
+          if [ "${{ inputs.target_registry }}" == "ghcr.io" ] || [ "${{ inputs.target_registry }}" == "both" ]; then
+            TARGET_IMAGE="ghcr.io/${{ github.repository_owner }}/${TARGET_REPO}:${TAG}"
+            TIMESTAMPED_IMAGE="ghcr.io/${{ github.repository_owner }}/${TARGET_REPO}:${TAG}-${TIMESTAMP}"
+            
+            echo "📦 Pushing to GitHub Container Registry:"
+            echo "  - ${TARGET_IMAGE}"
+            echo "  - ${TIMESTAMPED_IMAGE}"
+            
+            docker tag ${SOURCE_IMAGE} ${TARGET_IMAGE}
+            docker tag ${SOURCE_IMAGE} ${TIMESTAMPED_IMAGE}
+            docker push ${TARGET_IMAGE}
+            docker push ${TIMESTAMPED_IMAGE}
+            
+            echo "✅ Pushed to GHCR"
+          fi
+          
+          # Save pushed images to output
+          echo "pushed_images<<EOF" >> $GITHUB_ENV
+          docker images --format "{{.Repository}}:{{.Tag}}" | grep -E "${TARGET_REPO}|ghcr.io" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+      
+      - name: 📝 Push Summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          
+          # 🚀 Image Push Summary
+          
+          ## ✅ Successfully Pushed Images
+          
+          EOF
+          
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ env.pushed_images }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          
+          ## 📋 Details
+          
+          | Property | Value |
+          |----------|-------|
+          | 🐳 Source Image | `${{ inputs.image }}` |
+          | 📦 Registry | `${{ inputs.target_registry }}` |
+          | 🔒 Security Status | ✅ Passed all checks |
+          | 🔴 Critical Vulns | ${{ needs.security-scan.outputs.critical_count }} |
+          | 🟠 High Vulns | ${{ needs.security-scan.outputs.high_count }} |
+          | 📊 Total Vulns | ${{ needs.security-scan.outputs.total_count }} |
+          
+          ---
+          
+          *Images pushed at $(date -u '+%Y-%m-%d %H:%M:%S UTC')*
+          EOF
+
+  summary:
+    name: 📊 Workflow Summary
+    needs: [security-scan, push-image]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: 📊 Final Summary
+        run: |
+          echo "╔══════════════════════════════════════════════════════╗"
+          echo "║           Workflow Execution Complete                ║"
+          echo "╚══════════════════════════════════════════════════════╝"
+          echo ""
+          echo "Security Scan: ${{ needs.security-scan.result }}"
+          echo "Image Push: ${{ needs.push-image.result }}"
+          echo ""
+          
+          if [ "${{ needs.security-scan.result }}" == "success" ]; then
+            echo "✅ Security scan completed successfully"
+          else
+            echo "❌ Security scan failed"
+          fi
+          
+          if [ "${{ inputs.push_on_success }}" == "true" ]; then
+            if [ "${{ needs.push-image.result }}" == "success" ]; then
+              echo "✅ Image pushed to registry"
+            elif [ "${{ needs.push-image.result }}" == "skipped" ]; then
+              echo "⏭️  Image push skipped (scan failed)"
+            else
+              echo "❌ Image push failed"
+            fi
+          else
+            echo "ℹ️  Image push disabled for this run"
+          fi
+          echo ""
+          echo "═══════════════════════════════════════════════════════"
+          echo "Run Details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "═══════════════════════════════════════════════════════"
