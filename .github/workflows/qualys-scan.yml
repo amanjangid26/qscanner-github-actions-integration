@@ -1,0 +1,80 @@
+name: Qualys Container Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Docker image to scan (e.g., tomcat:10.0.0-M6-jdk11-corretto)'
+        required: true
+        default: 'tomcat:10.0.0-M6-jdk11-corretto'
+      
+      target_registry:
+        description: 'Target registry (e.g., docker.io/myorg/myapp:tag)'
+        required: true
+        default: 'docker.io/myorg/myapp:latest'
+
+env:
+  QUALYS_POD: ${{ secrets.QUALYS_POD }}
+  QUALYS_TOKEN: ${{ secrets.QUALYS_ACCESS_TOKEN }}
+  POLICY_TAGS: '2026_forrester_image_policy'
+
+jobs:
+  scan-and-push:
+    name: Scan and Push Image
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Pull Docker Image
+        run: |
+          echo "Pulling image: ${{ inputs.image }}"
+          docker pull ${{ inputs.image }}
+      
+      - name: Download Qualys Scanner
+        run: |
+          echo "Downloading Qualys Scanner..."
+          curl -L https://www.qualys.com/qscanner/download/v4.5.0/download_qscanner.sh -o download_qscanner.sh
+          chmod +x download_qscanner.sh
+          bash ./download_qscanner.sh
+          chmod +x ./linux-amd64/qscanner
+      
+      - name: Run Qualys Scan
+        run: |
+          echo "Running security scan..."
+          ./linux-amd64/qscanner image ${{ inputs.image }} \
+            --mode evaluate-policy \
+            --report-format json \
+            --pod ${{ env.QUALYS_POD }} \
+            --access-token ${{ env.QUALYS_TOKEN }} \
+            --tags "${{ env.POLICY_TAGS }}" \
+            --output-file scan-report.json
+      
+      - name: Upload Scan Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualys-scan-report
+          path: scan-report.json
+      
+      - name: Login to Docker Registry
+        run: |
+          echo "Logging into Docker registry..."
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+      
+      - name: Tag and Push Image
+        run: |
+          echo "Tagging image..."
+          docker tag ${{ inputs.image }} ${{ inputs.target_registry }}
+          
+          echo "Pushing image to registry..."
+          docker push ${{ inputs.target_registry }}
+          
+          echo "✅ Image pushed successfully to ${{ inputs.target_registry }}"
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Scan Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source Image:** \`${{ inputs.image }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Registry:** \`${{ inputs.target_registry }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ✅ Success" >> $GITHUB_STEP_SUMMARY
