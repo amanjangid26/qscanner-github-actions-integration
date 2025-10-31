@@ -45,8 +45,7 @@ jobs:
             --report-format json \
             --pod ${{ env.QUALYS_POD }} \
             --access-token ${{ env.QUALYS_TOKEN }} \
-            --tags "${{ env.POLICY_TAGS }}" \
-            --output-file scan-report.json
+            --tags "${{ env.POLICY_TAGS }}"
       
       - name: Upload Scan Report
         if: always()
