@@ -35,14 +35,13 @@ jobs:
           curl -L https://www.qualys.com/qscanner/download/v4.5.0/download_qscanner.sh -o download_qscanner.sh
           chmod +x download_qscanner.sh
           bash ./download_qscanner.sh
-          chmod +x ./linux-amd64/qscanner
       
       - name: Run Qualys Scan
         run: |
           echo "Running security scan..."
           ./linux-amd64/qscanner image ${{ inputs.image }} \
             --mode evaluate-policy \
-            --report-format json \
+            --report-format json,table \
             --pod ${{ env.QUALYS_POD }} \
             --access-token ${{ env.QUALYS_TOKEN }} \
             --tags "${{ env.POLICY_TAGS }}"
